@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Instant};
 
 use axum::{
     extract::{MatchedPath, Path, Query, Request, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -121,10 +121,12 @@ async fn instrument(State(state): State<AppState>, route: MatchedPath, request: 
     response
 }
 
-async fn serve_metrics(State(state): State<AppState>) -> Vec<u8> {
+async fn serve_metrics(State(state): State<AppState>) -> Response {
+    let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
-    TextEncoder::new().encode(&state.metrics.registry.gather(), &mut buffer).unwrap();
-    buffer
+    encoder.encode(&state.metrics.registry.gather(), &mut buffer).unwrap();
+    // Prometheus refuses to scrape a response without the right content type.
+    ([(CONTENT_TYPE, encoder.format_type().to_owned())], buffer).into_response()
 }
 
 fn app() -> Router {
@@ -175,6 +177,14 @@ mod tests {
         assert_eq!(serde_json::from_slice::<Item>(&body).unwrap().name, "item-7");
         assert_eq!(request("GET", "/items/x", "").await.0, StatusCode::BAD_REQUEST);
         assert_eq!(request("GET", "/items/1000", "").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_have_the_content_type_prometheus_needs() {
+        let request = Request::builder().uri("/metrics").body(Body::empty()).unwrap();
+        let response = app().oneshot(request).await.unwrap();
+        let content_type = response.headers()[CONTENT_TYPE].to_str().unwrap();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
     }
 
     #[tokio::test]
