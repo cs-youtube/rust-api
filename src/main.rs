@@ -1,6 +1,6 @@
 //! A small REST API, written the idiomatic way with axum and serde.
 //! cs-youtube/go-api has the same endpoints and metrics, so the two can be compared under load.
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     extract::{MatchedPath, Path, Query, Request, State},
@@ -12,7 +12,6 @@ use axum::{
 };
 use prometheus::{Encoder, HistogramOpts, HistogramVec, IntGauge, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Serialize, Deserialize)]
 struct Item {
@@ -27,14 +26,17 @@ struct Item {
     tags: Vec<String>,
 }
 
-fn new_item(id: u64) -> Item {
-    Item {
-        id,
-        name: format!("item-{id}"),
-        price: id as f64 * 1.5,
-        active: id % 2 == 0,
-        tags: vec!["alpha".into(), "beta".into(), "gamma".into()],
-    }
+/// The model: created once at start and only read after that.
+fn new_items(count: u64) -> Vec<Item> {
+    (0..count)
+        .map(|id| Item {
+            id,
+            name: format!("item-{id}"),
+            price: id as f64 * 1.5,
+            active: id % 2 == 0,
+            tags: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -42,15 +44,21 @@ struct ListParams {
     limit: Option<usize>,
 }
 
-async fn list_items(Query(params): Query<ListParams>) -> Json<Vec<Item>> {
-    let limit = params.limit.filter(|n| *n <= 1000).unwrap_or(50);
-    Json((0..limit as u64).map(new_item).collect())
+async fn list_items(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
+    let limit = params.limit.filter(|n| *n <= state.items.len()).unwrap_or(50);
+    Json(&state.items[..limit]).into_response()
 }
 
-async fn get_item(id: Result<Path<u64>, axum::extract::rejection::PathRejection>) -> Response {
-    match id {
-        Ok(Path(id)) => Json(new_item(id)).into_response(),
-        Err(_) => (StatusCode::BAD_REQUEST, "bad id").into_response(),
+async fn get_item(
+    State(state): State<AppState>,
+    id: Result<Path<u64>, axum::extract::rejection::PathRejection>,
+) -> Response {
+    let Ok(Path(id)) = id else {
+        return (StatusCode::BAD_REQUEST, "bad id").into_response();
+    };
+    match state.items.get(id as usize) {
+        Some(item) => Json(item).into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
@@ -61,18 +69,10 @@ async fn create_item(item: Result<Json<Item>, axum::extract::rejection::JsonReje
     }
 }
 
-#[derive(Deserialize)]
-struct WorkParams {
-    n: Option<u64>,
-}
-
-/// Burns CPU for a fixed amount of work: n rounds of SHA-256.
-async fn work(Query(params): Query<WorkParams>) -> String {
-    let mut sum = Sha256::digest(b"");
-    for _ in 0..params.n.filter(|n| *n <= 10_000_000).unwrap_or(10_000) {
-        sum = Sha256::digest(sum);
-    }
-    format!("{:02x}{:02x}{:02x}{:02x}\n", sum[0], sum[1], sum[2], sum[3])
+#[derive(Clone)]
+struct AppState {
+    items: Arc<Vec<Item>>,
+    metrics: Metrics,
 }
 
 #[derive(Clone)]
@@ -107,7 +107,8 @@ impl Metrics {
     }
 }
 
-async fn instrument(State(metrics): State<Metrics>, route: MatchedPath, request: Request, next: Next) -> Response {
+async fn instrument(State(state): State<AppState>, route: MatchedPath, request: Request, next: Next) -> Response {
+    let metrics = &state.metrics;
     let method = request.method().clone();
     metrics.in_flight.inc();
     let start = Instant::now();
@@ -120,27 +121,27 @@ async fn instrument(State(metrics): State<Metrics>, route: MatchedPath, request:
     response
 }
 
-async fn serve_metrics(State(metrics): State<Metrics>) -> Vec<u8> {
+async fn serve_metrics(State(state): State<AppState>) -> Vec<u8> {
     let mut buffer = Vec::new();
-    TextEncoder::new().encode(&metrics.registry.gather(), &mut buffer).unwrap();
+    TextEncoder::new().encode(&state.metrics.registry.gather(), &mut buffer).unwrap();
     buffer
 }
 
-fn app(metrics: Metrics) -> Router {
+fn app() -> Router {
+    let state = AppState { items: Arc::new(new_items(1000)), metrics: Metrics::new() };
     Router::new()
         .route("/items", get(list_items).post(create_item))
         .route("/items/{id}", get(get_item))
-        .route("/work", get(work))
-        .route_layer(middleware::from_fn_with_state(metrics.clone(), instrument))
+        .route_layer(middleware::from_fn_with_state(state.clone(), instrument))
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/metrics", get(serve_metrics))
-        .with_state(metrics)
+        .with_state(state)
 }
 
 #[tokio::main]
 async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    axum::serve(listener, app(Metrics::new())).await.unwrap();
+    axum::serve(listener, app()).await.unwrap();
 }
 
 #[cfg(test)]
@@ -157,7 +158,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap();
-        let response = app(Metrics::new()).oneshot(request).await.unwrap();
+        let response = app().oneshot(request).await.unwrap();
         let status = response.status();
         (status, response.into_body().collect().await.unwrap().to_bytes().to_vec())
     }
@@ -173,6 +174,7 @@ mod tests {
         let (_, body) = request("GET", "/items/7", "").await;
         assert_eq!(serde_json::from_slice::<Item>(&body).unwrap().name, "item-7");
         assert_eq!(request("GET", "/items/x", "").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request("GET", "/items/1000", "").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
