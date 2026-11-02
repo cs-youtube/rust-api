@@ -91,7 +91,8 @@ impl Metrics {
                 "Time from receiving a request to finishing its response.",
             )
             .buckets(vec![
-                0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
+                0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
             ]),
             &["method", "route", "code"],
         )
@@ -185,6 +186,27 @@ mod tests {
         let response = app().oneshot(request).await.unwrap();
         let content_type = response.headers()[CONTENT_TYPE].to_str().unwrap();
         assert!(content_type.starts_with("text/plain"), "{content_type}");
+    }
+
+    #[tokio::test]
+    async fn latency_histogram_has_the_agreed_buckets() {
+        let app = app();
+        let item = Request::builder().uri("/items/1").body(Body::empty()).unwrap();
+        app.clone().oneshot(item).await.unwrap();
+        let scrape = Request::builder().uri("/metrics").body(Body::empty()).unwrap();
+        let body = app.oneshot(scrape).await.unwrap().into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let les: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("http_request_duration_seconds_bucket{"))
+            .filter_map(|l| l.split(r#"le=""#).nth(1)?.split('"').next())
+            .collect();
+        // Must equal the Go service's list (cs-youtube/go-api).
+        let want = [
+            "0.000025", "0.00005", "0.0001", "0.00025", "0.0005", "0.001", "0.002", "0.005", "0.01", "0.02",
+            "0.05", "0.1", "0.2", "0.5", "1", "2", "5", "10", "+Inf",
+        ];
+        assert_eq!(les, want);
     }
 
     #[tokio::test]
